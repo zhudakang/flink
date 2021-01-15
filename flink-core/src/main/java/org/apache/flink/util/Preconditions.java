@@ -34,7 +34,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
 /**
- * A collection of static utility methods to validate input.
+ * A collection of static utility（实用的[juːˈtɪləti]） methods to validate input.
  *
  * <p>This class is modelled after Google Guava's Preconditions class, and partly takes code from
  * that class. We add this code to the Flink code base in order to reduce external dependencies.

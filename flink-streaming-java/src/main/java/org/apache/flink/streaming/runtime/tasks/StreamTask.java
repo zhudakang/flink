@@ -144,6 +144,11 @@ import static org.apache.flink.runtime.concurrent.FutureUtils.assertNoException;
  * @param <OUT>
  * @param <OP>
  */
+/**
+ * TM中执行的Task的基类 StreamTask
+ * 目前主要先看checkpoint逻辑
+ *
+ * */
 @Internal
 public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends AbstractInvokable
         implements AsyncExceptionHandler {

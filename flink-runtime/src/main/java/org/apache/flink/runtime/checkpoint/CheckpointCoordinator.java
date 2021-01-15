@@ -90,6 +90,10 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * acknowledgements. It also collects and maintains the overview of the state handles reported by
  * the tasks that acknowledge the checkpoint.
  */
+/**
+ *
+ * 周期性触发，由jobmanager中触发该类-> 执行-> CheckpointCoordinator.triggerCheckpoint
+ * */
 public class CheckpointCoordinator {
 
     private static final Logger LOG = LoggerFactory.getLogger(CheckpointCoordinator.class);
@@ -219,7 +223,8 @@ public class CheckpointCoordinator {
 
     private final boolean isExactlyOnceMode;
 
-    /** Flag represents there is an in-flight trigger request. */
+    /** Flag represents there is an in-flight trigger request.
+     * 标志表示有一个正在运行的触发请求 */
     private boolean isTriggering = false;
 
     private final CheckpointRequestDecider requestDecider;
@@ -479,6 +484,7 @@ public class CheckpointCoordinator {
         return triggerSavepointInternal(properties, advanceToEndOfEventTime, targetLocation);
     }
 
+    // 触发外部的检查点
     private CompletableFuture<CompletedCheckpoint> triggerSavepointInternal(
             final CheckpointProperties checkpointProperties,
             final boolean advanceToEndOfEventTime,
@@ -514,12 +520,20 @@ public class CheckpointCoordinator {
      *
      * @param isPeriodic Flag indicating whether this triggered checkpoint is periodic. If this flag
      *     is true, but the periodic scheduler is disabled, the checkpoint will be declined.
+     *     是否是周期的，如果为true，但是周期调度是disabled，那么这个checkpoint被拒绝
      * @return a future to the completed checkpoint.
      */
     public CompletableFuture<CompletedCheckpoint> triggerCheckpoint(boolean isPeriodic) {
+        // 注意这边的externalSavepointLocation为null，
         return triggerCheckpoint(checkpointProperties, null, isPeriodic, false);
     }
 
+    /**
+     * synchronous 同步的
+     * 最终通过 RPC 调用 TaskExecutorGateway.triggerCheckpoint，即请求执行 TaskExecutor.triggerCheckpoin()。
+     * 因为一个 TaskExecutor 中可能有多个 Task 正在运行，因而要根据触发 checkpoint 的 ExecutionAttemptID 找到对应的 Task，然后调用 Task.
+     * triggerCheckpointBarrier() 方法
+     * */
     @VisibleForTesting
     public CompletableFuture<CompletedCheckpoint> triggerCheckpoint(
             CheckpointProperties props,
@@ -528,6 +542,7 @@ public class CheckpointCoordinator {
             boolean advanceToEndOfTime) {
 
         if (advanceToEndOfTime && !(props.isSynchronous() && props.isSavepoint())) {
+            // 抛出异常
             return FutureUtils.completedExceptionally(
                     new IllegalArgumentException(
                             "Only synchronous savepoints are allowed to advance the watermark to MAX."));
@@ -536,21 +551,34 @@ public class CheckpointCoordinator {
         CheckpointTriggerRequest request =
                 new CheckpointTriggerRequest(
                         props, externalSavepointLocation, isPeriodic, advanceToEndOfTime);
+
+        // 这边写法，chooseRequestToExecute(request) 加锁处理，看看是否可以执行这个request, 是Optional，其实就是如果chooseRequestToExecute(request)值存在则调用后面的；
         chooseRequestToExecute(request).ifPresent(this::startTriggeringCheckpoint);
+
+        // 返回CompletedCheckpoint，最后结果在request里面
         return request.onCompletionPromise;
     }
 
+    /**
+     * 开始触发检查点
+     *
+     * */
     private void startTriggeringCheckpoint(CheckpointTriggerRequest request) {
         try {
             synchronized (lock) {
+                // 做个当前状态的检查
                 preCheckGlobalState(request.isPeriodic);
             }
 
+            // 检查所有我们需要的task都是running状态的
             final Execution[] executions = getTriggerExecutions();
+            // attempID 和 Vertex 在项目中也经常见到，
             final Map<ExecutionAttemptID, ExecutionVertex> ackTasks = getAckTasks();
 
             // we will actually trigger this checkpoint!
+            // 这里我们将真正触发checkpoint请求，checkState这个方法就是个校验 抛异常罢了
             Preconditions.checkState(!isTriggering);
+            // isTriggering更改状态
             isTriggering = true;
 
             final long timestamp = System.currentTimeMillis();
@@ -563,10 +591,13 @@ public class CheckpointCoordinator {
                                                     request.props,
                                                     ackTasks,
                                                     request.isPeriodic,
+                                                    // 唯一自增的checkpointID
                                                     checkpointIdAndStorageLocation.checkpointId,
+                                                    // CheckpointStorageLocation，用于存储这次checkpoint快照的路径
                                                     checkpointIdAndStorageLocation
                                                             .checkpointStorageLocation,
                                                     request.getOnCompletionFuture()),
+                                    // timer是ScheduledExecutor
                                     timer);
 
             final CompletableFuture<?> coordinatorCheckpointsComplete =
@@ -674,6 +705,8 @@ public class CheckpointCoordinator {
     /**
      * Initialize the checkpoint trigger asynchronously. It will be executed in io thread due to it
      * might be time-consuming.
+     * 异步初始化检查点触发器。因此，它将在io线程中执行
+     * 可能很费时。
      *
      * @param props checkpoint properties
      * @param externalSavepointLocation the external savepoint location, it might be null
@@ -864,11 +897,16 @@ public class CheckpointCoordinator {
     }
 
     /**
-     * The trigger request is failed prematurely without a proper initialization. There is no
+     * The trigger request is failed prematurely（过早地） without a proper initialization. There is no
      * resource to release, but the completion promise needs to fail manually here.
      *
      * @param onCompletionPromise the completion promise of the checkpoint/savepoint
      * @param throwable the reason of trigger failure
+     */
+    /**
+     * 触发器请求在没有正确初始化的情况下过早失败。根本没有
+     * 要释放的资源，但需要在此处手动失败。
+     * 注意CheckpointTriggerRequest
      */
     private void onTriggerFailure(
             CheckpointTriggerRequest onCompletionPromise, Throwable throwable) {
@@ -876,6 +914,8 @@ public class CheckpointCoordinator {
                 getCheckpointException(
                         CheckpointFailureReason.TRIGGER_CHECKPOINT_FAILURE, throwable);
         onCompletionPromise.completeExceptionally(checkpointException);
+        // 给null做强制类型转换是为了调用下面的onTriggerFailure(@Nullable PendingCheckpoint checkpoint, Throwable throwable)；
+        // 否则会死循环递归该方法
         onTriggerFailure((PendingCheckpoint) null, checkpointException);
     }
 
@@ -926,6 +966,10 @@ public class CheckpointCoordinator {
         }
     }
 
+    /**
+     * CheckpointRequestDecider 这个里面的chooseRequestToExecute
+     * 提交新的检查点请求，并决定是否可以执行该请求或其他一些请求
+     * */
     private Optional<CheckpointTriggerRequest> chooseRequestToExecute(
             CheckpointTriggerRequest request) {
         synchronized (lock) {
@@ -1842,6 +1886,7 @@ public class CheckpointCoordinator {
 
     // ------------------------------------------------------------------------
 
+    // Trigger 触发checkpoint，根据jobId
     private final class ScheduledTrigger implements Runnable {
 
         @Override
@@ -1936,11 +1981,13 @@ public class CheckpointCoordinator {
     }
 
     private void preCheckGlobalState(boolean isPeriodic) throws CheckpointException {
+        // in the meantime 同时， 避免coordinator在此期间关闭了
         // abort if the coordinator has been shutdown in the meantime
         if (shutdown) {
             throw new CheckpointException(CheckpointFailureReason.CHECKPOINT_COORDINATOR_SHUTDOWN);
         }
 
+        // 标记触发的检查点是否应立即安排下一个检查点，如果调度已禁用，则不允许定期检查点
         // Don't allow periodic checkpoint if scheduling has been disabled
         if (isPeriodic && !periodicScheduling) {
             throw new CheckpointException(CheckpointFailureReason.PERIODIC_SCHEDULER_SHUTDOWN);
@@ -2048,6 +2095,7 @@ public class CheckpointCoordinator {
 
         final Optional<CheckpointException> checkpointExceptionOptional =
                 findThrowable(throwable, CheckpointException.class);
+        // 传入Optional值为空,orElse会返回null,orElseGet会执行,并且返回执行方法体的结果;
         return checkpointExceptionOptional.orElseGet(
                 () -> new CheckpointException(defaultReason, throwable));
     }
@@ -2090,6 +2138,7 @@ public class CheckpointCoordinator {
             return onCompletionPromise;
         }
 
+        // get()的时候才会取这个结果
         public void completeExceptionally(CheckpointException exception) {
             onCompletionPromise.completeExceptionally(exception);
         }
